@@ -5,9 +5,10 @@ let enginePromise;
 async function getEngine() {
   if (!enginePromise) {
     enginePromise = CreateMLCEngine({
-      appConfig: prebuiltAppConfig('Phi-3.5-vision-instruct-q4f16_1-MLC'),
+      appConfig: prebuiltAppConfig('Llama-3.2-3B-Instruct-q4f16_1-MLC'),
     });
     await enginePromise.reload();
+    enginePromise = newEngine;
   }
   return enginePromise;
 }

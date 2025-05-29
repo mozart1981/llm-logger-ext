@@ -75,6 +75,9 @@ async function handleEvent(evt) {
 
     await chrome.storage.local.set({ log: summary });
 
+    queue.forEach(e => { e.imgBase64 = null; });
+    queue = [];
+
     queue = [];
   }
 }

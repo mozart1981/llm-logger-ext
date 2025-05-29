@@ -4,8 +4,9 @@ let engine = null;
 
 async function getEngine() {
   if (!engine) {
-    engine = await CreateMLCEngine('Phi-3.5-vision-instruct-q4f16_1-MLC');
+    engine = await CreateMLCEngine('Llama-3.2-3B-Instruct-q4f16_1-MLC');
     await engine.reload();
+    enginePromise = newEngine;
   }
   return engine;
 }
