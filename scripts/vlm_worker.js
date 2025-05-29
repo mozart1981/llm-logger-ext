@@ -1,22 +1,9 @@
-import { CreateMLCEngine, prebuiltAppConfig } from "@mlc-ai/web-llm";
-
-let enginePromise;
-
-async function getEngine() {
-  if (!enginePromise) {
-    enginePromise = CreateMLCEngine({
-      appConfig: prebuiltAppConfig('Llama-3.2-3B-Instruct-q4f16_1-MLC'),
-    });
-    await enginePromise.reload();
-    enginePromise = newEngine;
-  }
-  return enginePromise;
-}
+import enginePromise from './getEngine.js';
 
 self.onmessage = async ({ data }) => {
   if (data.cmd !== 'describe') return;
 
-  const engine = await getEngine();
+  const engine = await enginePromise;
 
   const userMessage = [
     {

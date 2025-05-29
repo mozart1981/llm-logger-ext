@@ -1,11 +1,12 @@
 import { defineConfig } from 'vite';
 import { resolve } from 'path';
-import fs from 'fs';
 
 export default defineConfig({
   build: {
     outDir: 'dist',
     target: 'esnext',
+    minify: false,
+    sourcemap: true,
     rollupOptions: {
       input: {
         'scripts/background': resolve(__dirname, 'scripts/background.js'),
@@ -22,5 +23,5 @@ export default defineConfig({
     },
     emptyOutDir: true,
   },
-  publicDir: '.',
+  publicDir: './public',
 });
