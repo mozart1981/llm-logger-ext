@@ -95,8 +95,17 @@ self.onmessage = async ({ data }) => {
  * @returns {string} Cache key
  */
 function generateCacheKey(events) {
-  return events
-    .map(e => `${e.type}-${e.timestamp || e.ts}`)
+  const { workflows = [], otherEvents = [] } = events;
+  
+  const workflowKeys = workflows.map(w => 
+    `wf-${w.type}-${w.duration}`
+  );
+  
+  const eventKeys = otherEvents.map(e => 
+    `evt-${e.actionType}-${e.timestamp}`
+  );
+  
+  return [...workflowKeys, ...eventKeys]
     .join('|')
     .slice(0, 100); // Limit key length
 }
@@ -140,15 +149,34 @@ function determineEventCategory(events) {
 
 /**
  * Groups related events together based on timing and context
- * @param {Array} events - Array of events to group
+ * @param {Object} eventData - Object containing workflows and otherEvents
  * @returns {Array} Array of event groups
  */
-function groupRelatedEvents(events) {
+function groupRelatedEvents(eventData) {
+  const { workflows = [], otherEvents = [] } = eventData;
+  
+  // Convert workflows into event-like objects for grouping
+  const workflowEvents = workflows.map(w => ({
+    type: 'workflow',
+    workflowType: w.type,
+    timestamp: w.startTime,
+    description: `${w.type} workflow: ${w.target}`,
+    steps: w.steps,
+    duration: w.duration
+  }));
+
+  // Combine workflow events with other events and sort by timestamp
+  const allEvents = [...workflowEvents, ...otherEvents].sort((a, b) => {
+    const timeA = a.timestamp || a.ts;
+    const timeB = b.timestamp || b.ts;
+    return timeA - timeB;
+  });
+
   const groups = [];
   let currentGroup = [];
   let lastTimestamp = 0;
   
-  events.forEach(event => {
+  allEvents.forEach(event => {
     const timestamp = event.timestamp || event.ts;
     const shouldStartNewGroup = shouldCreateNewGroup(event, currentGroup, timestamp, lastTimestamp);
     

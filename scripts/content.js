@@ -3,17 +3,10 @@ console.log('🔄 Content script loaded and initializing...');
 
 const KEEP = new Set([
   'click',      // for button clicks and link navigation
-  'input',      // for form inputs
-  'change',     // for form field changes
+  'change',     // for form field changes (including dropdowns)
+  'select',     // for dropdown menu interactions
   'submit',     // for form submissions
-  'navigation', // for page navigation
-  'select',     // for dropdown selections
-  'focus',      // when elements receive focus
-  'blur',       // when elements lose focus
-  'mousedown',  // for drag operations start
-  'mouseup',    // for drag operations end
-  'keydown',    // for keyboard interactions
-  'keyup'       // for keyboard interactions
+  'navigation'  // for page navigation
 ]);
 
 // Screenshot batching configuration
@@ -214,6 +207,79 @@ function getElementState(el) {
 let inputDebounceTimer = null;
 let lastInputValue = new Map(); // Track last value for change detection
 
+// Get form field value in a smart way
+function getFormFieldValue(el) {
+  if (!el || !el.tagName) return null;
+  
+  const type = el.type || el.tagName.toLowerCase();
+  const details = {
+    type,
+    name: el.name || '',
+    id: el.id || '',
+    fieldLabel: el.getAttribute('aria-label') || 
+                el.getAttribute('placeholder') || 
+                findFieldLabel(el)
+  };
+
+  // Handle different input types
+  switch(type) {
+    case 'select-one':
+    case 'select-multiple':
+      details.value = Array.from(el.selectedOptions).map(opt => opt.text).join(', ');
+      details.selectedValue = el.value;
+      details.allOptions = Array.from(el.options).map(opt => opt.text);
+      details.fieldType = 'dropdown';
+      break;
+      
+    case 'password':
+      details.value = '*'.repeat(el.value.length);
+      details.fieldType = 'password';
+      break;
+      
+    case 'checkbox':
+    case 'radio':
+      details.checked = el.checked;
+      details.value = el.value;
+      details.fieldType = type;
+      break;
+      
+    default:
+      details.value = el.value;
+      details.fieldType = 'text';
+  }
+
+  return details;
+}
+
+// Helper to find associated label text
+function findFieldLabel(el) {
+  // Check for explicit label
+  if (el.id) {
+    const label = document.querySelector(`label[for="${el.id}"]`);
+    if (label) return label.textContent.trim();
+  }
+  
+  // Check for wrapping label
+  const wrapper = el.closest('label');
+  if (wrapper) {
+    const labelText = wrapper.textContent.trim();
+    // Remove the field's own value from the label if it's there
+    return labelText.replace(el.value || '', '').trim();
+  }
+  
+  // Check for preceding label-like elements
+  const previousEl = el.previousElementSibling;
+  if (previousEl && (
+      previousEl.tagName === 'LABEL' ||
+      previousEl.classList.contains('label') ||
+      previousEl.classList.contains('field-label')
+    )) {
+    return previousEl.textContent.trim();
+  }
+  
+  return '';
+}
+
 // Enhanced context capture
 function getEventContext(target, type) {
   const context = {
@@ -235,122 +301,76 @@ function getEventContext(target, type) {
     context.path = domPath(target);
     context.state = getElementState(target);
     
-    // Get text content
-    let textContent = target.textContent?.trim();
-    if (textContent && textContent.length > 100) {
-      textContent = textContent.slice(0, 100) + '...';
-    }
-    
-    // Build identifier from available attributes
-    context.identifier = (
-      target.getAttribute('aria-label') ||
-      target.getAttribute('title') ||
-      target.getAttribute('alt') ||
-      target.getAttribute('name') ||
-      target.getAttribute('placeholder') ||
-      target.value ||
-      textContent ||
-      target.id ||
-      ''
-    ).trim();
+    // Get field details if it's a form element
+    if (target.tagName === 'SELECT' || target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+      const fieldDetails = getFormFieldValue(target);
+      context.fieldDetails = fieldDetails;
+      
+      // Create meaningful descriptions based on field type and event
+      switch(fieldDetails.fieldType) {
+        case 'dropdown':
+          if (type === 'select') {
+            context.description = `Opened ${fieldDetails.fieldLabel || 'dropdown'} menu (current: "${fieldDetails.value}")`;
+            context.actionType = 'dropdown_open';
+          } else if (type === 'change') {
+            context.description = `Changed ${fieldDetails.fieldLabel || 'dropdown'} to "${fieldDetails.value}"`;
+            context.actionType = 'field_change';
+            context.fieldChange = {
+              from: target.dataset.previousValue || '',
+              to: fieldDetails.value,
+              field: fieldDetails.fieldLabel || fieldDetails.name || 'dropdown',
+              options: fieldDetails.allOptions
+            };
+          }
+          break;
+          
+        case 'checkbox':
+          context.description = `${fieldDetails.checked ? 'Checked' : 'Unchecked'} ${fieldDetails.fieldLabel || 'checkbox'}`;
+          context.actionType = 'checkbox_change';
+          break;
+          
+        case 'radio':
+          context.description = `Selected "${fieldDetails.value}" for ${fieldDetails.fieldLabel || 'option'}`;
+          context.actionType = 'radio_selection';
+          break;
+          
+        default:
+          if (type === 'change' || type === 'input') {
+            context.description = `Updated ${fieldDetails.fieldLabel || fieldDetails.type} field`;
+            context.actionType = 'field_input';
+          }
+      }
+    } else {
+      // Handle non-form elements
+      const identifier = (
+        target.getAttribute('aria-label') ||
+        target.getAttribute('title') ||
+        target.getAttribute('alt') ||
+        target.getAttribute('name') ||
+        target.getAttribute('placeholder') ||
+        target.textContent?.trim() ||
+        target.id ||
+        ''
+      ).trim();
 
-    // Get parent context
-    const parentSelectors = [
-      '[role]',
-      'form',
-      'section',
-      'article',
-      'nav',
-      'header',
-      'footer',
-      'main',
-      'aside',
-      'dialog',
-      '.modal',
-      '[class*="container"]',
-      '[class*="wrapper"]',
-      'table',
-      'fieldset'
-    ];
-    
-    const parentContext = target.closest(parentSelectors.join(','));
-    if (parentContext) {
-      context.parentContext = {
-        type: parentContext.tagName.toLowerCase(),
-        role: parentContext.getAttribute('role'),
-        identifier: (
-          parentContext.getAttribute('aria-label') ||
-          parentContext.getAttribute('title') ||
-          parentContext.id ||
-          parentContext.className
-        )
-      };
-    }
-
-    // Add interaction details based on element type
-    switch(context.elementType) {
-      case 'a':
-        context.description = `Clicked link "${context.identifier}"${target.href ? ` leading to ${target.href}` : ''}`;
-        context.href = target.href;
-        break;
-        
-      case 'button':
-      case 'input':
-        if (target.type === 'submit' || target.type === 'button') {
-          context.description = `Clicked button "${context.identifier}"`;
+      if (type === 'click') {
+        if (target.tagName === 'BUTTON' || target.tagName === 'A' || target.getAttribute('role') === 'button') {
+          context.description = `Clicked ${identifier ? `"${identifier}"` : 'button'}`;
+          context.actionType = 'button_click';
         } else {
-          const fieldValue = getFormFieldValue(target);
-          context.fieldValue = fieldValue;
-          context.description = `Interacted with ${fieldValue.type} field "${context.identifier}"`;
+          context.description = `Clicked on ${target.tagName.toLowerCase()}${identifier ? ` "${identifier}"` : ''}`;
+          context.actionType = 'element_click';
         }
-        break;
-        
-      case 'select':
-        const fieldValue = getFormFieldValue(target);
-        context.fieldValue = fieldValue;
-        context.description = `Selected "${fieldValue.value}" from dropdown "${context.identifier}"`;
-        break;
-        
-      default:
-        context.description = `${type} on ${context.elementType}${context.identifier ? ` "${context.identifier}"` : ''}`;
+      }
     }
 
-    // Add form context if within a form
-    const form = target.closest('form');
-    if (form) {
-      context.form = {
-        id: form.id,
-        name: form.getAttribute('name'),
-        action: form.action,
-        method: form.method
-      };
+    // Store previous value for dropdowns
+    if (target.tagName === 'SELECT') {
+      target.dataset.previousValue = target.value;
     }
   }
 
   return context;
-}
-
-// Get form field value in a simple way
-function getFormFieldValue(el) {
-  if (!el || !el.tagName) return null;
-  
-  const type = el.type || el.tagName.toLowerCase();
-  const details = {
-    type,
-    name: el.name || '',
-    id: el.id || ''
-  };
-
-  // Handle password fields specially
-  if (type === 'password') {
-    details.value = '*'.repeat(el.value.length);
-  } else if (type === 'checkbox' || type === 'radio') {
-    details.checked = el.checked;
-  } else if (el.value !== undefined) {
-    details.value = el.value;
-  }
-
-  return details;
 }
 
 // Start collecting screenshots
@@ -393,11 +413,15 @@ async function processBatch() {
     // Send batch to background script for VLM processing
     await chrome.runtime.sendMessage({
       kind: 'process_batch',
-      screenshots: screenshotBatch,
+      screenshots: screenshotBatch.map(item => item.screenshot), // Send just the screenshot content
       metadata: {
         url: window.location.href,
         title: document.title,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        triggers: screenshotBatch.map(item => ({ 
+          timestamp: item.timestamp,
+          trigger: item.trigger 
+        }))
       }
     });
     
@@ -421,11 +445,16 @@ async function captureScreenshot(trigger) {
     });
     
     if (response && response.screenshot) {
-      screenshotBatch.push({
-        screenshot: response.screenshot,
-        timestamp: Date.now(),
-        trigger: trigger
-      });
+      // Ensure the screenshot is a string (base64 or data URL)
+      if (typeof response.screenshot === 'string') {
+        screenshotBatch.push({
+          screenshot: response.screenshot,
+          timestamp: Date.now(),
+          trigger: trigger
+        });
+      } else {
+        console.error('Screenshot response was not a string:', typeof response.screenshot);
+      }
     }
   } catch (error) {
     console.error('Screenshot capture failed:', error);

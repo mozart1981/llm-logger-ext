@@ -1,8 +1,39 @@
 console.log('🔧 background worker boot');
 
-const MAX_BATCH_SIZE = 10; // Increased batch size to handle more events
+const MAX_BATCH_SIZE = 10;
 let queue = [];
 let port = null;
+
+// Track workflow state
+let currentWorkflow = {
+  type: null,
+  target: null,
+  steps: [],
+  startTime: null,
+  lastEventTime: null
+};
+
+// Workflow classification patterns
+const WORKFLOW_PATTERNS = {
+  FIELD_UPDATE: {
+    name: 'Field Update',
+    startTriggers: ['select', 'click'],  // select for dropdowns, click for other fields
+    endTriggers: ['change'],
+    targetTypes: ['select', 'input', 'textarea']
+  },
+  FORM_SUBMISSION: {
+    name: 'Form Submission',
+    startTriggers: ['change'],
+    endTriggers: ['submit'],
+    targetTypes: ['form']
+  },
+  NAVIGATION: {
+    name: 'Navigation',
+    startTriggers: ['click'],
+    endTriggers: ['navigation'],
+    targetTypes: ['a', 'button']
+  }
+};
 
 // Ensure the offscreen document is active
 async function ensureOffscreen() {
@@ -32,9 +63,7 @@ async function connectToMLPipe() {
   });
 
   port.onMessage.addListener((msg) => {
-    if (msg.description) {
-      console.log('📸 [VLM DESCRIPTION]', msg.description);
-    }
+    // Only show the final summary from the summarizer, not VLM descriptions
     if (msg.summary) {
       console.log('📝 [FINAL SUMMARY]', msg.summary);
     }
@@ -42,6 +71,80 @@ async function connectToMLPipe() {
 }
 
 connectToMLPipe();
+
+// Detect workflow transitions
+function updateWorkflow(evt) {
+  const now = Date.now();
+  
+  // Check if this event starts a new workflow
+  for (const [type, pattern] of Object.entries(WORKFLOW_PATTERNS)) {
+    if (pattern.startTriggers.includes(evt.type) && 
+        pattern.targetTypes.includes(evt.elementType)) {
+      
+      // If we have an existing workflow that's too old, finish it
+      if (currentWorkflow.type && 
+          (now - currentWorkflow.lastEventTime > 5000)) { // 5 second timeout
+        finishWorkflow();
+      }
+      
+      // Start new workflow if we don't have one
+      if (!currentWorkflow.type) {
+        currentWorkflow = {
+          type,
+          target: evt.fieldDetails?.fieldLabel || evt.identifier,
+          steps: [],
+          startTime: now,
+          lastEventTime: now
+        };
+      }
+    }
+  }
+  
+  // Add step to current workflow if we have one
+  if (currentWorkflow.type) {
+    currentWorkflow.steps.push({
+      action: evt.description || evt.type,
+      timestamp: now,
+      details: {
+        type: evt.type,
+        elementType: evt.elementType,
+        fieldDetails: evt.fieldDetails,
+        actionType: evt.actionType
+      }
+    });
+    currentWorkflow.lastEventTime = now;
+    
+    // Check if this event ends the workflow
+    const pattern = WORKFLOW_PATTERNS[currentWorkflow.type];
+    if (pattern.endTriggers.includes(evt.type)) {
+      finishWorkflow();
+    }
+  }
+}
+
+// Finish current workflow and add to queue
+function finishWorkflow() {
+  if (currentWorkflow.type && currentWorkflow.steps.length > 0) {
+    queue.push({
+      type: 'workflow',
+      workflowType: currentWorkflow.type,
+      target: currentWorkflow.target,
+      steps: currentWorkflow.steps,
+      startTime: currentWorkflow.startTime,
+      endTime: currentWorkflow.lastEventTime,
+      duration: currentWorkflow.lastEventTime - currentWorkflow.startTime
+    });
+    
+    // Reset workflow
+    currentWorkflow = {
+      type: null,
+      target: null,
+      steps: [],
+      startTime: null,
+      lastEventTime: null
+    };
+  }
+}
 
 // Listen for tab navigations
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
@@ -60,7 +163,7 @@ chrome.runtime.onMessage.addListener(async (msg, sender) => {
   console.log('📨 Received message:', msg.kind, 'from tab:', sender.tab?.id);
   
   if (msg.kind === 'evt') {
-    handleEvent({
+    await handleEvent({
       ...msg,
       tabId: sender.tab.id,
       url: sender.tab.url
@@ -68,24 +171,61 @@ chrome.runtime.onMessage.addListener(async (msg, sender) => {
   } else if (msg.kind === 'screenshot') {
     try {
       console.log('📸 Taking screenshot for tab:', sender.tab.id);
-      // Take screenshot of the tab that sent the message
       const screenshot = await chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: 'png' });
-      
-      // Remove the data:image/png;base64, prefix
       const imgBase64 = screenshot.split(',')[1];
       
-      // Create an event with the screenshot
-      handleEvent({
+      // Add screenshot event to queue
+      await handleEvent({
         type: 'screenshot',
-        trigger: msg.trigger,
-        timestamp: msg.timestamp,
         imgBase64,
+        timestamp: Date.now(),
         tabId: sender.tab.id,
         url: sender.tab.url
       });
-      console.log('✅ Screenshot captured and processed');
+      
+      return { screenshot: imgBase64 };
     } catch (error) {
       console.error('Failed to capture screenshot:', error);
+      return { error: error.message };
+    }
+  } else if (msg.kind === 'process_batch') {
+    try {
+      console.log('🔄 Processing batch of screenshots:', msg.screenshots.length);
+      
+      // Process each screenshot with VLM
+      const descriptions = [];
+      for (const screenshot of msg.screenshots) {
+        const description = await describeWithVLM({
+          type: 'screenshot',
+          imgBase64: screenshot,
+          ...msg.metadata
+        });
+        descriptions.push(description);
+      }
+      
+      // Generate a summary of the batch
+      const summary = await summariseBatch(descriptions.map((desc, i) => ({
+        type: 'screenshot',
+        description: desc,
+        timestamp: msg.metadata.triggers[i].timestamp,
+        trigger: msg.metadata.triggers[i].trigger,
+        url: msg.metadata.url
+      })));
+      
+      // Store the summary
+      await chrome.storage.local.set({
+        log: summary,
+        lastBatch: {
+          timestamp: Date.now(),
+          url: msg.metadata.url,
+          descriptions
+        }
+      });
+      
+      return { success: true };
+    } catch (error) {
+      console.error('Failed to process screenshot batch:', error);
+      return { error: error.message };
     }
   }
   
@@ -94,21 +234,41 @@ chrome.runtime.onMessage.addListener(async (msg, sender) => {
 });
 
 async function handleEvent(evt) {
-  console.log('🎯 Processing event:', evt.type, evt.label || '');
+  console.log('🎯 Processing event:', evt.type, evt.actionType || '');
 
-  if (!evt.label && evt.imgBase64) {
-    console.log('🖼️ Getting VLM description for image...');
-    evt.label = await describeWithVLM(evt);
+  // Add meaningful context based on action type
+  if (evt.actionType) {
+    switch (evt.actionType) {
+      case 'field_change':
+        evt.label = `Changed ${evt.fieldChange.field} from "${evt.fieldChange.from}" to "${evt.fieldChange.to}"`;
+        break;
+      case 'checkbox_change':
+      case 'radio_selection':
+      case 'button_click':
+      case 'field_input':
+        evt.label = evt.description;
+        break;
+      default:
+        if (evt.description) {
+          evt.label = evt.description;
+        }
+    }
   }
 
-  queue.push(evt);
-  console.log('📦 Queue size:', queue.length);
+  // Update workflow state
+  updateWorkflow(evt);
 
-  // Save events more frequently with periodic screenshots
+  // Add event to queue
+  queue.push(evt);
+
+  // Check if we should process the batch
   if (queue.length >= MAX_BATCH_SIZE || evt.type === 'screenshot') {
+    // Finish any ongoing workflow
+    finishWorkflow();
+    
     console.log(`🔄 Processing batch of ${queue.length} events...`);
     const summary = await summariseBatch(queue);
-    console.log('📝 Summary saved to storage:', summary);
+    console.log('📝 Generated summary:', summary);
 
     // Store both summary and raw events
     await chrome.storage.local.set({ 
@@ -127,33 +287,23 @@ async function handleEvent(evt) {
 async function describeWithVLM(evt) {
   return new Promise((resolve) => {
     const id = crypto.randomUUID();
-    console.log('🔍 Requesting VLM description:', id);
-
-    // Extract relevant event context
-    const eventContext = {
-      type: evt.type,
-      label: evt.label,
-      path: evt.path,
-      elementType: evt.elementType,
-      elementState: evt.elementState,
-      description: evt.description,
-      inputDetails: evt.inputDetails,
-      rect: evt.rect,
-      timestamp: evt.timestamp || evt.ts,
-      url: evt.url,
-      tabId: evt.tabId
-    };
-
+    
     port.postMessage({
       cmd: 'describe',
       id,
       imgBase64: evt.imgBase64,
-      eventContext: eventContext
+      eventContext: {
+        type: evt.type,
+        timestamp: evt.timestamp,
+        url: evt.url,
+        actionType: evt.actionType,
+        fieldDetails: evt.fieldDetails,
+        description: evt.description
+      }
     });
 
     port.onMessage.addListener(function listener(msg) {
       if (msg.id === id && msg.description) {
-        console.log('✅ Got VLM description:', id);
         port.onMessage.removeListener(listener);
         resolve(msg.description);
       }
@@ -164,17 +314,41 @@ async function describeWithVLM(evt) {
 async function summariseBatch(events) {
   return new Promise((resolve) => {
     const id = crypto.randomUUID();
-    console.log('📊 Requesting batch summary:', id);
+    console.log('📊 Preparing batch summary for', events.length, 'events');
+    
+    // Group events by workflow
+    const workflows = events.filter(e => e.type === 'workflow');
+    const otherEvents = events.filter(e => e.type !== 'workflow');
+    
+    // Enhance events with workflow context
+    const enhancedEvents = {
+      workflows: workflows.map(w => ({
+        type: WORKFLOW_PATTERNS[w.workflowType]?.name || w.workflowType,
+        target: w.target,
+        duration: w.duration,
+        steps: w.steps.map(s => ({
+          action: s.action,
+          details: s.details
+        }))
+      })),
+      otherEvents: otherEvents.map(evt => ({
+        contextualDescription: evt.description || evt.label,
+        actionType: evt.actionType || 'interaction',
+        fieldDetails: evt.fieldDetails || null,
+        timestamp: evt.timestamp || evt.ts
+      }))
+    };
 
+    console.log('📤 Sending to summarizer:', enhancedEvents);
     port.postMessage({
       cmd: 'summarise',
       id,
-      events,
+      events: enhancedEvents,
     });
 
     port.onMessage.addListener(function listener(msg) {
       if (msg.id === id && msg.summary) {
-        console.log('✅ Got batch summary:', id);
+        console.log('📥 Received summary from worker');
         port.onMessage.removeListener(listener);
         resolve(msg.summary);
       }
