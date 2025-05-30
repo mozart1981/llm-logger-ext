@@ -158,6 +158,13 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   });
 });
 
+// Initialize AWS with config from storage
+chrome.storage.local.get(['awsConfig'], function(result) {
+  if (result.awsConfig) {
+    initializeAWS(result.awsConfig);
+  }
+});
+
 // Listen for content script events
 chrome.runtime.onMessage.addListener(async (msg, sender) => {
   console.log('📨 Received message:', msg.kind, 'from tab:', sender.tab?.id);
@@ -174,57 +181,35 @@ chrome.runtime.onMessage.addListener(async (msg, sender) => {
       const screenshot = await chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: 'png' });
       const imgBase64 = screenshot.split(',')[1];
       
-      // Add screenshot event to queue
-      await handleEvent({
-        type: 'screenshot',
-        imgBase64,
+      // Upload to S3 instead of processing
+      await uploadScreenshotToS3(imgBase64, {
         timestamp: Date.now(),
-        tabId: sender.tab.id,
-        url: sender.tab.url
+        url: sender.tab.url,
+        title: sender.tab.title,
+        trigger: msg.trigger
       });
       
       return { screenshot: imgBase64 };
     } catch (error) {
-      console.error('Failed to capture screenshot:', error);
+      console.error('Failed to capture/upload screenshot:', error);
       return { error: error.message };
     }
   } else if (msg.kind === 'process_batch') {
     try {
       console.log('🔄 Processing batch of screenshots:', msg.screenshots.length);
       
-      // Process each screenshot with VLM
-      const descriptions = [];
+      // Upload each screenshot to S3
       for (const screenshot of msg.screenshots) {
-        const description = await describeWithVLM({
-          type: 'screenshot',
-          imgBase64: screenshot,
-          ...msg.metadata
-        });
-        descriptions.push(description);
-      }
-      
-      // Generate a summary of the batch
-      const summary = await summariseBatch(descriptions.map((desc, i) => ({
-        type: 'screenshot',
-        description: desc,
-        timestamp: msg.metadata.triggers[i].timestamp,
-        trigger: msg.metadata.triggers[i].trigger,
-        url: msg.metadata.url
-      })));
-      
-      // Store the summary
-      await chrome.storage.local.set({
-        log: summary,
-        lastBatch: {
+        await uploadScreenshotToS3(screenshot, {
+          ...msg.metadata,
           timestamp: Date.now(),
-          url: msg.metadata.url,
-          descriptions
-        }
-      });
+          trigger: 'batch'
+        });
+      }
       
       return { success: true };
     } catch (error) {
-      console.error('Failed to process screenshot batch:', error);
+      console.error('Failed to upload screenshot batch:', error);
       return { error: error.message };
     }
   }

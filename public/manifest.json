@@ -1,7 +1,7 @@
 {
 "manifest_version": 3,
-"name": "8flow Logger-AI",
-"version": "0.2.1",
+"name": "Screenshot Logger S3",
+"version": "0.3.0",
 
 "icons": {
   "16": "icons/icon16.png",
@@ -18,11 +18,12 @@
 ],
 
 "host_permissions": [
-"<all_urls>"
+"<all_urls>",
+"https://*.amazonaws.com"
 ],
 
 "action": {
-"default_popup": "public/popup.html"
+"default_popup": "popup.html"
 },
 
 "background": {
@@ -49,6 +50,6 @@
 ],
 
 "content_security_policy": {
-"extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://huggingface.co https://raw.githubusercontent.com https://cdn.jsdelivr.net https://unpkg.com https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.huggingface.co https://raw.githubusercontent.com https://cdn-lfs-us-1.hf.co"
+"extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://*.amazonaws.com"
 }
 }
