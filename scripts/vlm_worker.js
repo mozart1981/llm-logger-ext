@@ -18,7 +18,13 @@ self.onmessage = async ({ data }) => {
         },
         {
           type: 'text',
-          text: 'Describe the user action in this image briefly.',
+          text: `Describe the user interaction in this image with specific details about:
+1. The exact UI element being interacted with (button, dropdown, text field, etc.)
+2. Any visible text or values being changed (from X to Y)
+3. The location or context of the interaction (which section, menu, or part of the interface)
+4. The state of any relevant UI elements (selected, expanded, focused, etc.)
+
+Keep the description concise but include all relevant details about the interaction.`,
         },
       ],
     },
@@ -26,8 +32,8 @@ self.onmessage = async ({ data }) => {
 
   const result = await engine.chat.completions.create({
     messages: userMessage,
-    max_tokens: 30,
-    temperature: 0.0,
+    max_tokens: 100,
+    temperature: 0.1,
   });
 
   self.postMessage({
