@@ -14,32 +14,33 @@ const CONSTANTS = {
 const summaryCache = new Map();
 
 // Template for workflow summary
-const SUMMARY_TEMPLATE = `Analyze this sequence of user interactions and create a step-by-step workflow summary.
-Focus on the user's journey through the system and key actions taken.
+const SUMMARY_TEMPLATE = `Analyze this sequence of user interactions and create a detailed workflow summary.
+Focus on the specific values and changes made during the user's interactions.
 
 Event Sequence:
 {eventBlocks}
 
 Provide a structured summary in the following format:
 
-WORKFLOW SUMMARY
+[FINAL SUMMARY] WORKFLOW SUMMARY
 --------------
 Step-by-Step Actions:
-1. [First action with specific details - include URLs, button names, form fields]
-2. [Second action with specific details]
+1. [First action with EXACT field values - What field was changed? From what value to what value?]
+2. [Second action with EXACT field values]
 3. [Continue with numbered steps...]
 
 Context Details:
-- Starting Point: [Initial page/state]
-- End Point: [Final page/state]
-- Key Interactions: [Important form fills, button clicks, etc.]
+- Starting Point: [Initial page/state with any relevant field values]
+- End Point: [Final page/state with any relevant field values]
+- Key Interactions: [List each form field change with exact before/after values]
 
 Process Analysis:
 - Main Task: [What was the user trying to accomplish]
 - Completion Status: [Whether the task was completed]
-- Notable Patterns: [Any repeated actions or workflow patterns]
+- Notable Patterns: [Any repeated actions or patterns in field updates]
 
-Keep the summary focused on the specific actions taken, including URLs, button names, form fields used etc.`;
+IMPORTANT: Always include the exact values that were changed in fields, not just the field names.
+For example, instead of "Updated Category field", say "Changed Category field from 'Electronics' to 'Books'"`;
 
 /**
  * Main message handler for the summarizer worker
@@ -332,7 +333,22 @@ function formatEventDetails(evt, index) {
   let mainDetail = `  ${eventNum}. [${timestamp}] `;
 
   // Add context-specific details
-  if (evt.type === 'navigation') {
+  if (evt.type === 'workflow') {
+    mainDetail += `${evt.workflowType} workflow on "${evt.target}"`;
+    if (evt.steps?.length > 0) {
+      details.push(mainDetail);
+      evt.steps.forEach((step, i) => {
+        let stepDetail = `    ${i + 1}. ${step.action}`;
+        if (step.details?.fieldDetails) {
+          const fd = step.details.fieldDetails;
+          stepDetail += ` (Field: "${fd.fieldLabel || fd.name}", Value: "${fd.value}")`;
+        }
+        details.push(stepDetail);
+      });
+      return details;
+    }
+  }
+  else if (evt.type === 'navigation') {
     mainDetail += `Navigated to: ${evt.pageTitle} (${evt.url})`;
   } 
   else if (evt.type === 'click') {
@@ -346,16 +362,31 @@ function formatEventDetails(evt, index) {
     }
   }
   else if (evt.type === 'input' || evt.type === 'change') {
-    mainDetail += `Entered data in ${evt.fieldType} field "${evt.fieldName}"`;
+    if (evt.fieldChange) {
+      mainDetail += `Changed "${evt.fieldChange.field}" from "${evt.fieldChange.from}" to "${evt.fieldChange.to}"`;
+      if (evt.fieldChange.options) {
+        details.push(`    Available options: ${evt.fieldChange.options.join(', ')}`);
+      }
+    } else if (evt.fieldDetails) {
+      mainDetail += `Updated ${evt.fieldDetails.fieldType} field "${evt.fieldDetails.fieldLabel}" to "${evt.fieldDetails.value}"`;
+    } else {
+      mainDetail += `Updated ${evt.fieldType || 'form'} field "${evt.fieldName || 'unknown'}"`;
+    }
     if (evt.parentContext) {
       mainDetail += ` in ${evt.parentContext}`;
     }
   }
   else if (evt.type === 'submit') {
     mainDetail += `Submitted form${evt.parentContext ? ` in ${evt.parentContext}` : ''}`;
+    if (evt.formData) {
+      details.push('    Form data:');
+      Object.entries(evt.formData).forEach(([key, value]) => {
+        details.push(`      ${key}: ${value}`);
+      });
+    }
   }
 
-  details.push(mainDetail);
+  details.unshift(mainDetail);
 
   // Add any additional context
   if (evt.description && !mainDetail.includes(evt.description)) {

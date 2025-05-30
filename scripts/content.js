@@ -218,7 +218,11 @@ function getFormFieldValue(el) {
     id: el.id || '',
     fieldLabel: el.getAttribute('aria-label') || 
                 el.getAttribute('placeholder') || 
-                findFieldLabel(el)
+                findFieldLabel(el) ||
+                el.name ||
+                el.id ||
+                type,
+    rawValue: el.value // Store raw value for comparison
   };
 
   // Handle different input types
@@ -227,7 +231,11 @@ function getFormFieldValue(el) {
     case 'select-multiple':
       details.value = Array.from(el.selectedOptions).map(opt => opt.text).join(', ');
       details.selectedValue = el.value;
-      details.allOptions = Array.from(el.options).map(opt => opt.text);
+      details.allOptions = Array.from(el.options).map(opt => ({
+        text: opt.text,
+        value: opt.value,
+        selected: opt.selected
+      }));
       details.fieldType = 'dropdown';
       break;
       
@@ -241,11 +249,31 @@ function getFormFieldValue(el) {
       details.checked = el.checked;
       details.value = el.value;
       details.fieldType = type;
+      // Get all related options for radio buttons
+      if (type === 'radio' && el.name) {
+        const radioGroup = document.querySelectorAll(`input[type="radio"][name="${el.name}"]`);
+        details.allOptions = Array.from(radioGroup).map(radio => ({
+          text: findFieldLabel(radio) || radio.value,
+          value: radio.value,
+          selected: radio.checked
+        }));
+      }
       break;
       
     default:
       details.value = el.value;
       details.fieldType = 'text';
+      if (el.maxLength > 0) {
+        details.maxLength = el.maxLength;
+      }
+      // Add any data validation attributes
+      const validationAttrs = ['min', 'max', 'pattern', 'required', 'minlength', 'maxlength'];
+      details.validation = {};
+      validationAttrs.forEach(attr => {
+        if (el.hasAttribute(attr)) {
+          details.validation[attr] = el.getAttribute(attr);
+        }
+      });
   }
 
   return details;
@@ -310,36 +338,59 @@ function getEventContext(target, type) {
       switch(fieldDetails.fieldType) {
         case 'dropdown':
           if (type === 'select') {
-            context.description = `Opened ${fieldDetails.fieldLabel || 'dropdown'} menu (current: "${fieldDetails.value}")`;
+            context.description = `Opened ${fieldDetails.fieldLabel} menu (current: "${fieldDetails.value}")`;
             context.actionType = 'dropdown_open';
           } else if (type === 'change') {
-            context.description = `Changed ${fieldDetails.fieldLabel || 'dropdown'} to "${fieldDetails.value}"`;
+            const previousValue = target.dataset.previousValue || '';
+            context.description = `Changed ${fieldDetails.fieldLabel} to "${fieldDetails.value}"`;
             context.actionType = 'field_change';
             context.fieldChange = {
-              from: target.dataset.previousValue || '',
+              field: fieldDetails.fieldLabel,
+              from: previousValue,
               to: fieldDetails.value,
-              field: fieldDetails.fieldLabel || fieldDetails.name || 'dropdown',
-              options: fieldDetails.allOptions
+              options: fieldDetails.allOptions.map(opt => opt.text)
             };
           }
           break;
           
         case 'checkbox':
-          context.description = `${fieldDetails.checked ? 'Checked' : 'Unchecked'} ${fieldDetails.fieldLabel || 'checkbox'}`;
+          context.description = `${fieldDetails.checked ? 'Checked' : 'Unchecked'} ${fieldDetails.fieldLabel}`;
           context.actionType = 'checkbox_change';
+          context.fieldChange = {
+            field: fieldDetails.fieldLabel,
+            from: !fieldDetails.checked,
+            to: fieldDetails.checked,
+            type: 'boolean'
+          };
           break;
           
         case 'radio':
-          context.description = `Selected "${fieldDetails.value}" for ${fieldDetails.fieldLabel || 'option'}`;
+          context.description = `Selected "${fieldDetails.value}" for ${fieldDetails.fieldLabel}`;
           context.actionType = 'radio_selection';
+          context.fieldChange = {
+            field: fieldDetails.fieldLabel,
+            from: fieldDetails.allOptions.find(opt => opt.selected && opt.value !== fieldDetails.value)?.text || '',
+            to: fieldDetails.value,
+            options: fieldDetails.allOptions.map(opt => opt.text)
+          };
           break;
           
         default:
           if (type === 'change' || type === 'input') {
-            context.description = `Updated ${fieldDetails.fieldLabel || fieldDetails.type} field`;
+            const previousValue = target.dataset.previousValue || '';
+            context.description = `Updated ${fieldDetails.fieldLabel}`;
             context.actionType = 'field_input';
+            context.fieldChange = {
+              field: fieldDetails.fieldLabel,
+              from: previousValue,
+              to: fieldDetails.value,
+              type: fieldDetails.type
+            };
           }
       }
+      
+      // Store current value for next change
+      target.dataset.previousValue = fieldDetails.rawValue;
     } else {
       // Handle non-form elements
       const identifier = (
@@ -362,11 +413,6 @@ function getEventContext(target, type) {
           context.actionType = 'element_click';
         }
       }
-    }
-
-    // Store previous value for dropdowns
-    if (target.tagName === 'SELECT') {
-      target.dataset.previousValue = target.value;
     }
   }
 
@@ -443,6 +489,11 @@ async function captureScreenshot(trigger) {
       trigger,
       timestamp: Date.now()
     });
+    
+    if (response.skipped) {
+      console.log('⏭️ Screenshot skipped - tab not active');
+      return;
+    }
     
     if (response && response.screenshot) {
       // Ensure the screenshot is a string (base64 or data URL)

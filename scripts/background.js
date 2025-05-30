@@ -102,16 +102,27 @@ function updateWorkflow(evt) {
   
   // Add step to current workflow if we have one
   if (currentWorkflow.type) {
-    currentWorkflow.steps.push({
+    const stepDetails = {
       action: evt.description || evt.type,
       timestamp: now,
       details: {
         type: evt.type,
         elementType: evt.elementType,
         fieldDetails: evt.fieldDetails,
-        actionType: evt.actionType
+        actionType: evt.actionType,
+        // Add field change details if available
+        fieldChange: evt.fieldChange ? {
+          field: evt.fieldChange.field,
+          from: evt.fieldChange.from,
+          to: evt.fieldChange.to,
+          options: evt.fieldChange.options
+        } : null,
+        // Add form data if available
+        formData: evt.formData
       }
-    });
+    };
+
+    currentWorkflow.steps.push(stepDetails);
     currentWorkflow.lastEventTime = now;
     
     // Check if this event ends the workflow
@@ -125,6 +136,11 @@ function updateWorkflow(evt) {
 // Finish current workflow and add to queue
 function finishWorkflow() {
   if (currentWorkflow.type && currentWorkflow.steps.length > 0) {
+    // Extract field changes for the summary
+    const fieldChanges = currentWorkflow.steps
+      .filter(step => step.details.fieldChange)
+      .map(step => step.details.fieldChange);
+    
     queue.push({
       type: 'workflow',
       workflowType: currentWorkflow.type,
@@ -132,7 +148,8 @@ function finishWorkflow() {
       steps: currentWorkflow.steps,
       startTime: currentWorkflow.startTime,
       endTime: currentWorkflow.lastEventTime,
-      duration: currentWorkflow.lastEventTime - currentWorkflow.startTime
+      duration: currentWorkflow.lastEventTime - currentWorkflow.startTime,
+      fieldChanges // Add field changes to the workflow summary
     });
     
     // Reset workflow
@@ -171,6 +188,19 @@ chrome.runtime.onMessage.addListener(async (msg, sender) => {
   } else if (msg.kind === 'screenshot') {
     try {
       console.log('📸 Taking screenshot for tab:', sender.tab.id);
+      
+      // Get the current active tab in the window
+      const tabs = await chrome.tabs.query({ 
+        active: true, 
+        windowId: sender.tab.windowId 
+      });
+      
+      // Only take screenshot if the sender tab is the active tab
+      if (tabs[0]?.id !== sender.tab.id) {
+        console.log('⏭️ Skipping screenshot - tab not active');
+        return { skipped: true };
+      }
+      
       const screenshot = await chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: 'png' });
       const imgBase64 = screenshot.split(',')[1];
       
