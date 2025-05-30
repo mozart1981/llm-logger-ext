@@ -1,39 +1,338 @@
 import enginePromise from './getEngine.js';
 
+// Constants for event categorization and timing
+const CONSTANTS = {
+  MAJOR_EVENT_TYPES: ['submit', 'navigation', 'click'],
+  FORM_EVENT_TYPES: ['input', 'change', 'focus', 'blur', 'submit', 'invalid'],
+  DRAG_EVENT_TYPES: ['dragstart', 'drag', 'dragenter', 'dragover', 'dragleave', 'drop'],
+  TEXT_EVENT_TYPES: ['input', 'keydown', 'keyup', 'paste', 'cut', 'copy'],
+  GROUP_TIME_THRESHOLD: 2000, // milliseconds
+  MAX_CACHE_SIZE: 50
+};
+
+// Cache for summarized responses
+const summaryCache = new Map();
+
+// Template for workflow summary
+const SUMMARY_TEMPLATE = `Analyze this sequence of user interactions and create a step-by-step workflow summary.
+Focus on the user's journey through the system and key actions taken.
+
+Event Sequence:
+{eventBlocks}
+
+Provide a structured summary in the following format:
+
+WORKFLOW SUMMARY
+--------------
+Step-by-Step Actions:
+1. [First action with specific details - include URLs, button names, form fields]
+2. [Second action with specific details]
+3. [Continue with numbered steps...]
+
+Context Details:
+- Starting Point: [Initial page/state]
+- End Point: [Final page/state]
+- Key Interactions: [Important form fills, button clicks, etc.]
+
+Process Analysis:
+- Main Task: [What was the user trying to accomplish]
+- Completion Status: [Whether the task was completed]
+- Notable Patterns: [Any repeated actions or workflow patterns]
+
+Keep the summary focused on the specific actions taken, including URLs, button names, form fields used etc.`;
+
+/**
+ * Main message handler for the summarizer worker
+ */
 self.onmessage = async ({ data }) => {
   if (data.cmd !== 'summarise') return;
 
-  const engine = await enginePromise;
-
-  // Build a string prompt for LLMs with enhanced details
-  const textBlocks = data.events.map((e, i) => {
-    const details = [e.type];
-    if (e.description) details.push(e.description);
-    if (e.label) details.push(e.label);
-    if (e.url && !e.description) details.push(e.url);
+  try {
+    const engine = await enginePromise;
+    const cacheKey = generateCacheKey(data.events);
     
-    return `Frame ${i + 1}: ${details.join(' — ')}`;
-  });
+    // Check cache first
+    if (summaryCache.has(cacheKey)) {
+      self.postMessage(summaryCache.get(cacheKey));
+      return;
+    }
 
-  const prompt = `Below is a detailed sequence of user interactions with a web browser, organized in frames. Each frame represents a distinct user action or browser event. Please create a comprehensive summary that includes:
-1. The sequence of pages visited and interactions performed
-2. Any specific content the user engaged with (text inputs, clicks, etc.)
-3. The timing and flow of actions
-4. Important details about what the user viewed or interacted with
+    const groupedEvents = groupRelatedEvents(data.events);
+    const eventBlocks = buildEventBlocks(groupedEvents);
+    const prompt = SUMMARY_TEMPLATE.replace('{eventBlocks}', eventBlocks.join('\n\n'));
 
-Events:
-${textBlocks.join('\n')}
+    const result = await engine.chat.completions.create({
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 500,
+      temperature: 0.2,
+    });
 
-Create a detailed paragraph (100-150 words) that tells the story of what the user did, maintaining chronological order and including specific details about their interactions. Reference frame numbers when describing key actions.`;
+    const response = {
+      id: data.id,
+      summary: result.choices[0].message.content.trim(),
+    };
 
-  const result = await engine.chat.completions.create({
-    messages: [{ role: 'user', content: prompt }],
-    max_tokens: 250,
-    temperature: 0.3,
-  });
+    // Cache the response
+    summaryCache.set(cacheKey, response);
+    if (summaryCache.size > CONSTANTS.MAX_CACHE_SIZE) {
+      const firstKey = summaryCache.keys().next().value;
+      summaryCache.delete(firstKey);
+    }
 
-  self.postMessage({
-    id: data.id,
-    summary: result.choices[0].message.content.trim(),
-  });
+    self.postMessage(response);
+  } catch (error) {
+    console.error('Error in summarizer worker:', error);
+    self.postMessage({
+      id: data.id,
+      error: error.message
+    });
+  }
 };
+
+/**
+ * Generates a cache key for a set of events
+ * @param {Array} events - Array of events
+ * @returns {string} Cache key
+ */
+function generateCacheKey(events) {
+  return events
+    .map(e => `${e.type}-${e.timestamp || e.ts}`)
+    .join('|')
+    .slice(0, 100); // Limit key length
+}
+
+/**
+ * Determines the category of an event
+ * @param {Array} events - Array of related events
+ * @returns {string} Event category
+ */
+function determineEventCategory(events) {
+  // Look for structured analysis first
+  const structuredEvent = events.find(e => e.structuredAnalysis?.interaction?.category);
+  if (structuredEvent) {
+    return structuredEvent.structuredAnalysis.interaction.category;
+  }
+
+  // Fall back to event type analysis
+  const types = events.map(e => e.type);
+  
+  if (types.some(t => CONSTANTS.FORM_EVENT_TYPES.slice(0, 2).includes(t))) {
+    return 'Form Submission';
+  }
+  if (types.some(t => CONSTANTS.FORM_EVENT_TYPES.includes(t))) {
+    return 'Form Input';
+  }
+  if (types.some(t => ['tabNavigate', 'navigation'].includes(t))) {
+    return 'Navigation';
+  }
+  if (types.some(t => CONSTANTS.DRAG_EVENT_TYPES.slice(0, 2).includes(t))) {
+    return 'Content Manipulation';
+  }
+  if (types.some(t => ['click', 'dblclick', 'contextmenu'].includes(t))) {
+    return 'UI Interaction';
+  }
+  if (types.some(t => ['copy', 'cut', 'paste'].includes(t))) {
+    return 'Data Transfer';
+  }
+  
+  return 'Other Interaction';
+}
+
+/**
+ * Groups related events together based on timing and context
+ * @param {Array} events - Array of events to group
+ * @returns {Array} Array of event groups
+ */
+function groupRelatedEvents(events) {
+  const groups = [];
+  let currentGroup = [];
+  let lastTimestamp = 0;
+  
+  events.forEach(event => {
+    const timestamp = event.timestamp || event.ts;
+    const shouldStartNewGroup = shouldCreateNewGroup(event, currentGroup, timestamp, lastTimestamp);
+    
+    if (shouldStartNewGroup) {
+      if (currentGroup.length > 0) {
+        groups.push(currentGroup);
+      }
+      currentGroup = [event];
+    } else {
+      currentGroup.push(event);
+    }
+    
+    lastTimestamp = timestamp;
+  });
+  
+  if (currentGroup.length > 0) {
+    groups.push(currentGroup);
+  }
+  
+  return groups;
+}
+
+/**
+ * Determines if a new group should be created
+ * @param {Object} event - Current event
+ * @param {Array} currentGroup - Current group of events
+ * @param {number} timestamp - Current event timestamp
+ * @param {number} lastTimestamp - Last event timestamp
+ * @returns {boolean} Whether to create a new group
+ */
+function shouldCreateNewGroup(event, currentGroup, timestamp, lastTimestamp) {
+  return (
+    isMajorEvent(event) ||
+    currentGroup.length === 0 ||
+    timestamp - lastTimestamp > CONSTANTS.GROUP_TIME_THRESHOLD ||
+    !areEventsRelated(currentGroup[0], event) ||
+    haveDifferentCategories(currentGroup[0], event)
+  );
+}
+
+/**
+ * Checks if two events have different categories
+ * @param {Object} event1 - First event
+ * @param {Object} event2 - Second event
+ * @returns {boolean} Whether events have different categories
+ */
+function haveDifferentCategories(event1, event2) {
+  const cat1 = event1.structuredAnalysis?.interaction?.category;
+  const cat2 = event2.structuredAnalysis?.interaction?.category;
+  return cat1 && cat2 && cat1 !== cat2;
+}
+
+/**
+ * Checks if an event is a major event
+ * @param {Object} event - Event to check
+ * @returns {boolean} Whether the event is major
+ */
+function isMajorEvent(event) {
+  return CONSTANTS.MAJOR_EVENT_TYPES.includes(event.type) || 
+         event.structuredAnalysis?.interaction?.category === 'Navigation';
+}
+
+/**
+ * Checks if two events are related
+ * @param {Object} event1 - First event
+ * @param {Object} event2 - Second event
+ * @returns {boolean} Whether events are related
+ */
+function areEventsRelated(event1, event2) {
+  if (!event1 || !event2) return false;
+  
+  // Check structured analysis first
+  if (event1.structuredAnalysis?.interaction && event2.structuredAnalysis?.interaction) {
+    const context1 = event1.structuredAnalysis.interaction.context;
+    const context2 = event2.structuredAnalysis.interaction.context;
+    
+    if (context1?.user_flow && context1.user_flow === context2?.user_flow) return true;
+    if (context1?.parent_container && context1.parent_container === context2?.parent_container) return true;
+  }
+  
+  // Fall back to basic relationship checks
+  return (
+    event1.path === event2.path ||
+    (isFormEvent(event1) && isFormEvent(event2)) ||
+    (isDragEvent(event1) && isDragEvent(event2)) ||
+    (isTextEvent(event1) && isTextEvent(event2))
+  );
+}
+
+/**
+ * Checks if an event is a form event
+ * @param {Object} event - Event to check
+ * @returns {boolean} Whether the event is a form event
+ */
+function isFormEvent(event) {
+  return CONSTANTS.FORM_EVENT_TYPES.includes(event.type);
+}
+
+/**
+ * Checks if an event is a drag event
+ * @param {Object} event - Event to check
+ * @returns {boolean} Whether the event is a drag event
+ */
+function isDragEvent(event) {
+  return CONSTANTS.DRAG_EVENT_TYPES.includes(event.type);
+}
+
+/**
+ * Checks if an event is a text event
+ * @param {Object} event - Event to check
+ * @returns {boolean} Whether the event is a text event
+ */
+function isTextEvent(event) {
+  return CONSTANTS.TEXT_EVENT_TYPES.includes(event.type) && 
+         ['input', 'textarea'].includes(event.elementType);
+}
+
+/**
+ * Builds event blocks for summary
+ * @param {Array} groupedEvents - Array of event groups
+ * @returns {Array} Formatted event blocks
+ */
+function buildEventBlocks(groupedEvents) {
+  return groupedEvents.map((group, i) => {
+    const mainEvent = group[0];
+    const category = determineEventCategory(group);
+    
+    const details = [
+      `=== Action Group ${i + 1}: ${category.toUpperCase()} ===`
+    ];
+
+    group.forEach((evt, j) => {
+      const eventDetails = formatEventDetails(evt, j);
+      details.push(...eventDetails);
+    });
+
+    return details.join('\n');
+  });
+}
+
+/**
+ * Formats event details for summary
+ * @param {Object} evt - Event to format
+ * @param {number} index - Event index
+ * @returns {Array} Formatted event details
+ */
+function formatEventDetails(evt, index) {
+  const timestamp = new Date(evt.timestamp || evt.ts).toLocaleTimeString();
+  const eventNum = index + 1;
+  const details = [];
+
+  // Start with timestamp and basic info
+  let mainDetail = `  ${eventNum}. [${timestamp}] `;
+
+  // Add context-specific details
+  if (evt.type === 'navigation') {
+    mainDetail += `Navigated to: ${evt.pageTitle} (${evt.url})`;
+  } 
+  else if (evt.type === 'click') {
+    if (evt.href) {
+      mainDetail += `Clicked link "${evt.identifier}" → ${evt.href}`;
+    } else {
+      mainDetail += `Clicked ${evt.elementType} "${evt.identifier}"`;
+      if (evt.parentContext) {
+        mainDetail += ` in ${evt.parentContext}`;
+      }
+    }
+  }
+  else if (evt.type === 'input' || evt.type === 'change') {
+    mainDetail += `Entered data in ${evt.fieldType} field "${evt.fieldName}"`;
+    if (evt.parentContext) {
+      mainDetail += ` in ${evt.parentContext}`;
+    }
+  }
+  else if (evt.type === 'submit') {
+    mainDetail += `Submitted form${evt.parentContext ? ` in ${evt.parentContext}` : ''}`;
+  }
+
+  details.push(mainDetail);
+
+  // Add any additional context
+  if (evt.description && !mainDetail.includes(evt.description)) {
+    details.push(`    Details: ${evt.description}`);
+  }
+
+  return details;
+}
